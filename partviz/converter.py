@@ -8,6 +8,8 @@ import numpy as np
 from vtk import vtkCellArray, vtkPoints, vtkPolyData, vtkXMLPolyDataWriter
 from vtk.util.numpy_support import numpy_to_vtk
 
+from .transform import transform_to_lab
+
 
 def parse_step_keys(h5_file):
     step_items = []
@@ -43,7 +45,7 @@ def add_point_data(polydata, name, values):
     polydata.GetPointData().AddArray(vtk_array)
 
 
-def write_step_vtp(step_group, output_file):
+def write_step_vtp(step_group, output_file, lab_frame=False, absolute_momentum=False):
     x = to_1d_array(step_group, "x")
     y = to_1d_array(step_group, "y")
     z = to_1d_array(step_group, "z")
@@ -52,10 +54,27 @@ def write_step_vtp(step_group, output_file):
     if not (len(y) == n_particles and len(z) == n_particles):
         raise ValueError("x, y, z arrays have different lengths")
 
-    coordinates = np.column_stack((x, y, z)).astype(np.float64, copy=False)
+    positions = np.column_stack((x, y, z)).astype(np.float64, copy=False)
+
+    momentum_fields = ("px", "py", "pz")
+    has_momentum = all(f in step_group for f in momentum_fields)
+    if has_momentum:
+        momenta = np.column_stack([
+            to_1d_array(step_group, f) for f in momentum_fields
+        ]).astype(np.float64, copy=False)
+        if momenta.shape[0] != n_particles:
+            has_momentum = False
+            momenta = None
+    else:
+        momenta = None
+
+    if lab_frame:
+        positions, momenta = transform_to_lab(
+            positions, momenta, step_group, absolute_momentum=absolute_momentum
+        )
 
     points = vtkPoints()
-    points.SetData(numpy_to_vtk(coordinates, deep=1))
+    points.SetData(numpy_to_vtk(positions, deep=1))
 
     verts = vtkCellArray()
     for particle_id in range(n_particles):
@@ -66,7 +85,11 @@ def write_step_vtp(step_group, output_file):
     polydata.SetPoints(points)
     polydata.SetVerts(verts)
 
-    for field in ("px", "py", "pz", "q", "sp", "bin", "Ex", "Ey", "Ez", "Bx", "By", "Bz"):
+    if momenta is not None:
+        for i, field in enumerate(momentum_fields):
+            add_point_data(polydata, field, momenta[:, i])
+
+    for field in ("q", "sp", "bin", "Ex", "Ey", "Ez", "Bx", "By", "Bz"):
         if field in step_group:
             field_values = to_1d_array(step_group, field)
             if len(field_values) == n_particles:
@@ -82,7 +105,8 @@ def write_step_vtp(step_group, output_file):
     return n_particles
 
 
-def export_step(input_file, output_file, output_name, step_key, step_number):
+def export_step(input_file, output_file, output_name, step_key, step_number,
+                lab_frame=False, absolute_momentum=False):
     with h5py.File(input_file, "r") as h5_file:
         step_group = h5_file[step_key]
         required_fields = {"x", "y", "z"}
@@ -93,7 +117,11 @@ def export_step(input_file, output_file, output_name, step_key, step_number):
                 "error": "missing one of x/y/z",
             }
 
-        particle_count = write_step_vtp(step_group, output_file)
+        particle_count = write_step_vtp(
+            step_group, output_file,
+            lab_frame=lab_frame,
+            absolute_momentum=absolute_momentum,
+        )
         timestep = get_scalar_attr(step_group, "TIME", float(step_number))
 
     return {
@@ -128,15 +156,27 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Convert OPAL H5 phase-space output to ParaView VTP files.")
     parser.add_argument("input", nargs="?", default="Drift-IP.h5", help="Input OPAL H5 file")
     parser.add_argument("--output-dir", default="paraview", help="Directory for VTP and PVD outputs")
-    parser.add_argument("--prefix", default="bunch", help="Prefix for generated output files")
+    parser.add_argument("--prefix", default=None,
+                        help="Prefix for generated output files (default: input filename stem)")
     parser.add_argument("--workers", type=int, default=1, help="Number of parallel worker processes (default: 1)")
+    parser.add_argument("--lab-frame", "-L", action="store_true",
+                        help="Transform particle positions/momenta to the global lab frame "
+                             "using RefPartR and RefPartP step attributes.")
+    parser.add_argument("--absolute-momentum", action="store_true",
+                        help="When --lab-frame is set, add RefPartP to momenta to get "
+                             "absolute lab-frame momenta instead of beam-relative momenta.")
     args = parser.parse_args(argv)
+
+    if args.absolute_momentum and not args.lab_frame:
+        print("--absolute-momentum requires --lab-frame")
+        return 1
 
     if args.workers < 1:
         print("--workers must be >= 1")
         return 1
 
     input_path = Path(args.input)
+    prefix = args.prefix if args.prefix is not None else input_path.stem
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -149,10 +189,12 @@ def main(argv=None):
 
     print(f"Found {len(steps)} steps. Writing VTP files to: {output_dir}")
     print(f"Using {args.workers} worker process(es).")
+    if args.lab_frame:
+        print("Lab-frame transform enabled.")
 
     jobs = []
     for step_key, step_number in steps:
-        output_name = f"{args.prefix}_step{step_number:05d}.vtp"
+        output_name = f"{prefix}_step{step_number:05d}.vtp"
         output_file = output_dir / output_name
         jobs.append((
             str(input_path),
@@ -160,6 +202,8 @@ def main(argv=None):
             output_name,
             step_key,
             step_number,
+            args.lab_frame,
+            args.absolute_momentum,
         ))
 
     results = []
@@ -216,7 +260,7 @@ def main(argv=None):
         print("No VTP files were written.")
         return 1
 
-    pvd_file = output_dir / f"{args.prefix}.pvd"
+    pvd_file = output_dir / f"{prefix}.pvd"
     write_pvd_file(pvd_file, pvd_entries)
     print(f"Created ParaView collection: {pvd_file}")
     return 0

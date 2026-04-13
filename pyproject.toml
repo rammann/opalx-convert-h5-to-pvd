@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "partviz"
-version = "0.1.1"
-description = "Convert OPAL H5 phase-space output to ParaView VTP/PVD files"
+version = "0.2.0"
+description = "Convert OPAL H5 phase-space output to ParaView VTP/PVD files (with lab-frame transform)"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
   "h5py",
   "numpy",
+  "scipy",
   "vtk",
 ]
 
